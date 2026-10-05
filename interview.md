@@ -6242,16 +6242,700 @@ externalTrafficPolicy: Local
     
 ---
 
-### Affinity, anti-affinity**
+### Что такое Affinity и Anti-Affinity?
 
-- Ответ
-    
-    В спецификации пода указываются требования и пожелания к узлам, а также к уже существующим подам.
-    
-    Как нод селектор. Но можно заказать условия. Типа метка может быть определенных типов, перечисленных.
-    
+**Affinity / Anti-Affinity** — правила для Kubernetes Scheduler, которые влияют на то, на каких Node будут размещаться Pod'ы.
+
+Упрощённо:
+
+```text
+Node Affinity
+→ "На каких Node я хочу запускаться?"
+
+Pod Affinity
+→ "Рядом с какими Pod'ами я хочу запускаться?"
+
+Pod Anti-Affinity
+→ "Рядом с какими Pod'ами я НЕ хочу запускаться?"
+```
+
+Основные виды:
+
+- `nodeAffinity`
+- `podAffinity`
+- `podAntiAffinity`
+
 ---
-    
+
+## Node Affinity
+
+**Node Affinity** определяет, на каких Node можно или желательно запускать Pod.
+
+Работает с **labels Node**.
+
+Например, есть:
+
+```text
+node-1 → disk=ssd
+node-2 → disk=ssd
+node-3 → disk=hdd
+```
+
+Мы хотим запускать приложение только на SSD Node:
+
+```yaml
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: disk
+              operator: In
+              values:
+                - ssd
+```
+
+Scheduler сможет выбрать:
+
+```text
+             Pod
+              ↓
+         disk=ssd
+          ↙    ↘
+      node-1  node-2
+        ✅      ✅
+
+      node-3
+        ❌
+```
+
+### Node Affinity vs nodeSelector
+
+Простой вариант:
+
+```yaml
+nodeSelector:
+  disk: ssd
+```
+
+Node Affinity позволяет описывать более сложные условия:
+
+```text
+In
+NotIn
+Exists
+DoesNotExist
+Gt
+Lt
+```
+
+Например:
+
+```yaml
+matchExpressions:
+  - key: kubernetes.io/arch
+    operator: In
+    values:
+      - arm64
+```
+
+Pod будет запускаться только на ARM64 Node.
+
+Например, в смешанном EKS-кластере:
+
+```text
+node-1 → amd64 ❌
+node-2 → arm64 ✅
+node-3 → arm64 ✅
+```
+
+---
+
+## Pod Affinity
+
+**Pod Affinity** позволяет размещать Pod рядом с другими Pod'ами.
+
+Здесь Scheduler смотрит не только на Node labels, а на **labels уже работающих Pod'ов**.
+
+Например:
+
+```text
+redis
+backend
+```
+
+Мы хотим, чтобы `backend` находился на той же Node, что и `redis`:
+
+```text
+node-1
+├── redis
+└── backend
+
+node-2
+```
+
+Пример:
+
+```yaml
+affinity:
+  podAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+            - key: app
+              operator: In
+              values:
+                - redis
+        topologyKey: kubernetes.io/hostname
+```
+
+Это означает:
+
+```text
+Найди Pod:
+app=redis
+
+↓
+
+Найди Node, где он работает
+
+↓
+
+Размести мой Pod
+в той же topology domain
+```
+
+При:
+
+```yaml
+topologyKey: kubernetes.io/hostname
+```
+
+topology domain — конкретная Node.
+
+### Когда используется Pod Affinity?
+
+Например:
+
+- уменьшение latency между приложениями;
+- размещение тесно связанных компонентов рядом;
+- локальность данных или сетевого взаимодействия.
+
+Используется реже, чем Anti-Affinity.
+
+---
+
+## Pod Anti-Affinity
+
+**Pod Anti-Affinity** делает обратное — позволяет разносить Pod'ы по разным topology domains.
+
+Типичный сценарий — **High Availability**.
+
+Например, Deployment имеет:
+
+```yaml
+replicas: 3
+```
+
+Без дополнительных ограничений Scheduler потенциально может разместить несколько Pod'ов на одной Node:
+
+```text
+node-1
+├── backend-1
+├── backend-2
+└── backend-3
+
+node-2
+node-3
+```
+
+Если `node-1` упадёт:
+
+```text
+node-1 💀
+
+backend-1 💀
+backend-2 💀
+backend-3 💀
+```
+
+С Pod Anti-Affinity можно потребовать разнести реплики:
+
+```text
+node-1        node-2        node-3
+   │             │             │
+backend-1     backend-2     backend-3
+```
+
+Теперь падение одной Node:
+
+```text
+node-1 💀     node-2        node-3
+
+backend-1 ❌  backend-2 ✅  backend-3 ✅
+```
+
+Пример:
+
+```yaml
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+            - key: app
+              operator: In
+              values:
+                - backend
+        topologyKey: kubernetes.io/hostname
+```
+
+Означает:
+
+```text
+Не размещай этот Pod
+в одной topology domain
+с другим Pod,
+у которого:
+
+app=backend
+```
+
+---
+
+## Required vs Preferred
+
+Affinity правила бывают **жёсткими** и **мягкими**.
+
+### requiredDuringSchedulingIgnoredDuringExecution
+
+```text
+required = ОБЯЗАТЕЛЬНО
+```
+
+Scheduler обязан выполнить условие.
+
+Например, есть три Node и strict Anti-Affinity:
+
+```text
+node-1 → backend-1
+node-2 → backend-2
+node-3 → backend-3
+```
+
+Увеличиваем:
+
+```yaml
+replicas: 4
+```
+
+Но правило запрещает размещать два `backend` Pod на одной Node:
+
+```text
+node-1 → backend-1
+node-2 → backend-2
+node-3 → backend-3
+
+backend-4 → Pending
+```
+
+Подходящей Node нет.
+
+---
+
+### preferredDuringSchedulingIgnoredDuringExecution
+
+```text
+preferred = ЖЕЛАТЕЛЬНО
+```
+
+Scheduler постарается выполнить условие, но может его нарушить.
+
+Желательно:
+
+```text
+node-1 → backend-1
+node-2 → backend-2
+node-3 → backend-3
+```
+
+Если появляется четвёртая replica:
+
+```text
+node-1 → backend-1
+         backend-4
+
+node-2 → backend-2
+node-3 → backend-3
+```
+
+Это допустимо.
+
+Поэтому:
+
+```text
+required
+→ условие обязательно
+→ иначе Pod может остаться Pending
+
+preferred
+→ условие желательно
+→ Scheduler может нарушить его, если нужно
+```
+
+---
+
+## Что означает IgnoredDuringExecution?
+
+Например:
+
+```text
+requiredDuringSchedulingIgnoredDuringExecution
+```
+
+Разделяется на две части:
+
+```text
+requiredDuringScheduling
+→ правило обязательно во время scheduling
+
+IgnoredDuringExecution
+→ после запуска Pod изменение условий
+  само по себе не приводит к выселению Pod
+```
+
+Например:
+
+```text
+node-1:
+disk=ssd
+
+↓
+
+Scheduler размещает Pod
+
+↓
+
+Pod работает
+
+↓
+
+label Node меняется:
+
+disk=hdd
+```
+
+Несмотря на то что Node больше не соответствует первоначальному Node Affinity, уже работающий Pod из-за одного этого изменения автоматически не будет перемещён.
+
+---
+
+## topologyKey
+
+В Pod Affinity и Anti-Affinity нужно определить, что означает:
+
+```text
+"рядом"
+```
+
+или:
+
+```text
+"не рядом"
+```
+
+Для этого используется:
+
+```yaml
+topologyKey:
+```
+
+### Разделение по Node
+
+```yaml
+topologyKey: kubernetes.io/hostname
+```
+
+Каждая Node считается отдельной topology domain:
+
+```text
+node-1        node-2        node-3
+backend-1     backend-2     backend-3
+```
+
+То есть Anti-Affinity может использоваться для распределения Pod'ов по разным Node.
+
+---
+
+### Разделение по Availability Zone
+
+Можно использовать:
+
+```yaml
+topologyKey: topology.kubernetes.io/zone
+```
+
+Например:
+
+```text
+eu-north-1a      eu-north-1b      eu-north-1c
+     │                │                │
+ backend-1         backend-2         backend-3
+```
+
+Теперь Pod'ы распределены между AZ.
+
+Если:
+
+```text
+eu-north-1a 💀
+```
+
+останутся:
+
+```text
+eu-north-1b → backend-2 ✅
+eu-north-1c → backend-3 ✅
+```
+
+Это позволяет повысить отказоустойчивость приложения.
+
+---
+
+## Node Affinity vs Pod Affinity
+
+Главное не путать:
+
+### Node Affinity
+
+Смотрит на **labels Node**:
+
+```text
+Pod
+ ↓
+"Хочу Node с arch=arm64"
+ ↓
+Node labels
+```
+
+Например:
+
+```yaml
+kubernetes.io/arch: arm64
+```
+
+---
+
+### Pod Affinity
+
+Смотрит на **labels других Pod'ов**:
+
+```text
+Pod
+ ↓
+"Хочу находиться рядом с app=redis"
+ ↓
+Pod labels
+```
+
+---
+
+### Pod Anti-Affinity
+
+Тоже смотрит на **labels других Pod'ов**, но требует или предпочитает разнести их:
+
+```text
+Pod
+ ↓
+"Не хочу находиться рядом с app=backend"
+ ↓
+Pod labels
+```
+
+---
+
+## Affinity vs Taints/Tolerations
+
+Это разные механизмы.
+
+Affinity:
+
+```text
+Pod → выбирает подходящие Node
+```
+
+Taints:
+
+```text
+Node → отталкивает неподходящие Pod
+```
+
+Например:
+
+```text
+Node Affinity:
+"Я хочу работать на ARM Node"
+
+Taint:
+"На этой Node нельзя работать обычным Pod"
+
+Toleration:
+"Этот Pod имеет право работать на такой Node"
+```
+
+`toleration` сам по себе не означает, что Pod обязательно попадёт на эту Node.
+
+Часто механизмы используются вместе:
+
+```text
+Node:
+dedicated=monitoring
+
+Taint:
+dedicated=monitoring:NoSchedule
+
+Pod:
+toleration → разрешает попасть на Node
+nodeAffinity → заставляет/предпочитает выбрать эту Node
+```
+
+---
+
+## Affinity vs topologySpreadConstraints
+
+Для равномерного распределения реплик также существует:
+
+```yaml
+topologySpreadConstraints:
+```
+
+Pod Anti-Affinity обычно формулирует правило:
+
+```text
+"Не размещай меня рядом с такими Pod'ами"
+```
+
+А `topologySpreadConstraints`:
+
+```text
+"Распредели мои Pod'ы максимально равномерно
+между topology domains"
+```
+
+Например:
+
+```text
+AZ-A       AZ-B       AZ-C
+
+3 Pods     3 Pods     3 Pods
+```
+
+Поэтому для сложного равномерного распределения большого количества реплик часто удобнее `topologySpreadConstraints`.
+
+---
+
+## Вопросы с подвохом
+
+### Что произойдёт, если required Affinity невозможно выполнить?
+
+Pod останется:
+
+```text
+Pending
+```
+
+пока не появится подходящая Node/условия не изменятся.
+
+---
+
+### Anti-Affinity обязательно означает разные Node?
+
+**Нет.**
+
+Это определяется:
+
+```yaml
+topologyKey:
+```
+
+Например:
+
+```text
+kubernetes.io/hostname
+→ разные Node
+
+topology.kubernetes.io/zone
+→ разные AZ
+```
+
+---
+
+### Preferred гарантирует выполнение правила?
+
+**Нет.**
+
+Это только предпочтение Scheduler.
+
+```text
+required  → обязан
+preferred → постарается
+```
+
+---
+
+### Может ли Node Affinity использовать labels Pod?
+
+**Нет.**
+
+```text
+Node Affinity → Node labels
+
+Pod Affinity / Anti-Affinity → Pod labels
+```
+
+---
+
+### Переместит ли Kubernetes Pod, если Node перестала соответствовать `IgnoredDuringExecution`?
+
+Обычно нет.
+
+Правило проверялось во время scheduling, а изменение соответствующего label после запуска само по себе не вызывает переселение Pod.
+
+---
+
+## Коротко для собеседования
+
+> **Affinity и Anti-Affinity — это scheduling rules, позволяющие управлять размещением Pod'ов. Node Affinity выбирает Node по их labels. Pod Affinity позволяет размещать Pod рядом с другими Pod'ами, а Pod Anti-Affinity — разносить их по разным Node, AZ или другим topology domains. Правила могут быть required — обязательными, или preferred — желательными.**
+
+Для запоминания:
+
+```text
+Node Affinity
+→ хочу Node с определёнными labels
+
+Pod Affinity
+→ хочу быть рядом с определёнными Pod
+
+Pod Anti-Affinity
+→ хочу быть подальше от определённых Pod
+
+
+required
+→ обязательно
+→ иначе Pending
+
+preferred
+→ желательно
+→ можно нарушить
+
+
+topologyKey: kubernetes.io/hostname
+→ Node
+
+topologyKey: topology.kubernetes.io/zone
+→ Availability Zone
+```
+---
+
 
 ### Что такое Helm
 
