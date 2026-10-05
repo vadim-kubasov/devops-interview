@@ -4610,39 +4610,1356 @@ StatefulSet + PVC + Service + Secrets
     
 ---
 
-### Что такое Service
+### Что такое Service в Kubernetes?
 
-- Ответ
-    
-    Service - обеспечивает сетевой доступ к поду снаружи.
-    
-    Это тип ресурса, который заставляет прокси настраиваться на пересылку запросов на набор контейнеров.
-    
-    У каждого пода айпишник постоянно меняется. И сервис это абстракция, которая предоставляет сетевой доступ к приложению, который работает на группе подов. А также балансирует запросы к этим подам.
-    
-    Отличается от всех других тем, что не предоставляет свой айпишник
-    
+**Service** — Kubernetes-ресурс, который предоставляет стабильную сетевую точку доступа к одному или нескольким Pod'ам.
+
+Pod'ы являются эфемерными: они могут пересоздаваться, перемещаться между Node и получать новые IP-адреса.
+
+Например:
+
+```text
+Было:
+
+backend-pod-1 → 10.0.1.10
+backend-pod-2 → 10.0.2.15
+
+pod-1 умер и пересоздался:
+
+backend-pod-1 → 10.0.3.27
+backend-pod-2 → 10.0.2.15
+```
+
+Если другое приложение обращалось напрямую к `10.0.1.10`, после пересоздания Pod адрес перестанет работать.
+
+Service решает эту проблему:
+
+```text
+               backend Service
+                10.100.0.50
+                     │
+             ┌───────┴───────┐
+             ↓               ↓
+        10.0.3.27         10.0.2.15
+           pod-1             pod-2
+```
+
+IP/DNS Service остаётся стабильным, даже если Pod'ы пересоздаются.
+
+Обычно Service находит свои Pod'ы через labels и selector:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+spec:
+  selector:
+    app: backend
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+Pod'ы:
+
+```yaml
+metadata:
+  labels:
+    app: backend
+```
+
+В результате:
+
+```text
+Service
+selector: app=backend
+       ↓
+EndpointSlice
+       ↓
+10.0.1.10:8080
+10.0.2.15:8080
+10.0.3.20:8080
+```
+
+Другие приложения могут обращаться к Service через DNS:
+
+```text
+backend
+```
+
+В другом namespace:
+
+```text
+backend.default
+```
+
+Полное имя:
+
+```text
+backend.default.svc.cluster.local
+```
+
 ---
 
-### Какие типы service бывают?
+## Какие типы Service бывают?
 
-- Ответ
-    - Без селектора
-    - ClusterIP - по умолчанию. Сервису выделяется отдельный айпишник внутри кластера. Доступ можно сделать с помощью проксировани.
-    - NodePort - выделяется айпи внутри кластера, и на каждом узле выделяется порт из диапазона 30000 - 32767.  То есть указываем на каком порте узлов это работает
-    - LoadBalancer - использует внешний айпи адрес. И он уже перенаправляет трафик на нод порт и кластер айпи, которые создаются автоматически. Минус в том, что внешний айпи адрес стоит денег.
-    - ExternalName - перенаправление трафика. Через cname в днс кластере.
+Основные значения `spec.type`:
+
+1. `ClusterIP`
+2. `NodePort`
+3. `LoadBalancer`
+4. `ExternalName`
+
+Также важно знать:
+
+- **Headless Service** — Service с `clusterIP: None`;
+- **Service без selector** — Service, endpoints которого не определяются автоматически по Pod labels.
 
 ---
 
-### то такое Ingress
+## ClusterIP
 
-- Ответ
-    
-    Это не тип сервиса, но это абстракция связана с предоставлением доступа к сервисам извне.
-    
-    Чем-то похоже на нжинкс. Который по локейшнам перенаправляет что-то куда-то.
-    
+**ClusterIP — тип Service по умолчанию.**
+
+Kubernetes выделяет Service виртуальный IP-адрес, доступный внутри кластера.
+
+Например:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+spec:
+  type: ClusterIP
+  selector:
+    app: backend
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+Получаем:
+
+```text
+backend Service
+ClusterIP: 10.100.0.50
+Port: 80
+```
+
+Приложение внутри кластера обращается:
+
+```text
+http://backend:80
+```
+
+или:
+
+```text
+http://10.100.0.50:80
+```
+
+Дальше трафик направляется на один из endpoints:
+
+```text
+Pod A
+ │
+ │ GET backend:80
+ ↓
+ClusterIP
+10.100.0.50:80
+ │
+ ├──→ backend-pod-1:8080
+ ├──→ backend-pod-2:8080
+ └──→ backend-pod-3:8080
+```
+
+### Когда используется
+
+Это самый распространённый тип Service для общения приложений **внутри Kubernetes**.
+
+Например:
+
+```text
+frontend
+    ↓
+backend-service
+    ↓
+backend Pods
+```
+
+или:
+
+```text
+backend
+    ↓
+redis-service
+    ↓
+Redis
+```
+
+Из интернета ClusterIP напрямую недоступен.
+
+### Коротко
+
+```text
+ClusterIP
+→ стабильный виртуальный IP
+→ доступен внутри кластера
+→ тип Service по умолчанию
+→ распределяет трафик между endpoints
+```
+
+---
+
+## NodePort
+
+**NodePort** позволяет обращаться к Service через определённый порт на Kubernetes Node.
+
+По умолчанию Kubernetes использует диапазон:
+
+```text
+30000-32767
+```
+
+Пример:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+spec:
+  type: NodePort
+  selector:
+    app: backend
+  ports:
+    - port: 80
+      targetPort: 8080
+      nodePort: 31234
+```
+
+Теперь Service доступен через:
+
+```text
+<NodeIP>:31234
+```
+
+Причём порт открывается для Service на **каждой Node**:
+
+```text
+node-1:31234 ──┐
+node-2:31234 ──┼──→ Service → backend Pods
+node-3:31234 ──┘
+```
+
+Например:
+
+```text
+Client
+   ↓
+192.168.1.20:31234
+   ↓
+node-2
+   ↓
+Service
+   ↓
+backend-pod-1:8080
+```
+
+Pod необязательно должен находиться на Node, на которую пришёл запрос.
+
+При:
+
+```yaml
+externalTrafficPolicy: Cluster
+```
+
+возможна ситуация:
+
+```text
+Client
+   ↓
+node-2:31234
+   ↓
+Service
+   ↓
+pod на node-3
+```
+
+При:
+
+```yaml
+externalTrafficPolicy: Local
+```
+
+используются только локальные endpoints этой Node:
+
+```text
+Client
+   ↓
+node-2:31234
+   ↓
+pod на node-2
+```
+
+### Когда используется
+
+NodePort часто является промежуточным механизмом для внешних Load Balancer'ов.
+
+Также его можно использовать для прямого доступа:
+
+```text
+http://NODE_IP:31234
+```
+
+Но для production-приложений напрямую NodePort обычно менее удобен, чем LoadBalancer или Ingress/Gateway.
+
+### Важно
+
+`NodePort` включает функциональность `ClusterIP`.
+
+Упрощённо:
+
+```text
+NodePort
+   ↓
+ClusterIP
+   ↓
+Pods
+```
+
+### Коротко
+
+```text
+NodePort
+→ открывает порт на каждой Node
+→ обычно диапазон 30000-32767
+→ внешний клиент может обратиться NodeIP:NodePort
+→ внутри всё равно есть ClusterIP
+```
+
+---
+
+## LoadBalancer
+
+**LoadBalancer** используется для публикации Service наружу через внешний Load Balancer.
+
+Чаще всего применяется в облачных Kubernetes-кластерах:
+
+- AWS
+- GCP
+- Azure
+
+Пример:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+spec:
+  type: LoadBalancer
+  selector:
+    app: backend
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+В облаке Kubernetes-интеграция может создать внешний Load Balancer.
+
+Например:
+
+```text
+Internet
+    ↓
+AWS Load Balancer
+    ↓
+Kubernetes Service
+    ↓
+backend Pods
+```
+
+Клиенту уже не нужно знать IP Kubernetes Node:
+
+```text
+Client
+   ↓
+my-lb.amazonaws.com
+   ↓
+AWS Load Balancer
+   ↓
+Kubernetes
+   ↓
+Pod
+```
+
+В классической реализации:
+
+```text
+LoadBalancer
+     ↓
+NodePort
+     ↓
+ClusterIP
+     ↓
+Pods
+```
+
+То есть `LoadBalancer` обычно включает возможности `NodePort`, а `NodePort` — `ClusterIP`.
+
+Однако конкретный data path зависит от cloud provider и реализации.
+
+Например, AWS NLB при определённых настройках может иметь непосредственно Pod IP в качестве targets:
+
+```text
+Internet
+   ↓
+NLB
+   ↓
+Target Group
+   ↓
+Pod IP
+```
+
+### Когда используется
+
+Когда нужно предоставить приложение наружу:
+
+```text
+Internet → Kubernetes application
+```
+
+Например, внешний API:
+
+```text
+api.example.com
+       ↓
+Load Balancer
+       ↓
+Service
+       ↓
+API Pods
+```
+
+### Недостаток
+
+Если создать отдельный `LoadBalancer` Service для каждого приложения:
+
+```text
+service-A → AWS LB #1
+service-B → AWS LB #2
+service-C → AWS LB #3
+```
+
+получится много внешних Load Balancer'ов, каждый из которых является отдельным облачным ресурсом.
+
+Поэтому для HTTP/HTTPS часто используют Ingress:
+
+```text
+                  один ALB / Ingress
+                         │
+                ┌────────┼────────┐
+                ↓        ↓        ↓
+             service-A service-B service-C
+```
+
+### Коротко
+
+```text
+LoadBalancer
+→ предоставляет Service наружу
+→ обычно создаёт/использует внешний cloud Load Balancer
+→ может использовать NodePort
+→ конкретная реализация зависит от cloud provider
+```
+
+---
+
+## ExternalName
+
+**ExternalName** отличается от остальных типов Service.
+
+Он не направляет трафик на Kubernetes Pods, а создаёт **DNS alias на внешний DNS name**.
+
+Например, база данных находится вне Kubernetes:
+
+```text
+database.example.com
+```
+
+Можно создать:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: database
+spec:
+  type: ExternalName
+  externalName: database.example.com
+```
+
+Теперь приложения внутри Kubernetes могут обращаться:
+
+```text
+database.default.svc.cluster.local
+```
+
+Kubernetes DNS вернёт CNAME:
+
+```text
+database.default.svc.cluster.local
+                ↓
+              CNAME
+                ↓
+database.example.com
+```
+
+После этого клиент уже подключается к адресу, полученному через DNS.
+
+То есть здесь нет обычной цепочки:
+
+```text
+Service → EndpointSlice → Pod
+```
+
+и kube-proxy не выполняет обычную Service-балансировку.
+
+### Когда используется
+
+Например, приложение ожидает базу по адресу:
+
+```text
+database
+```
+
+В production база находится в AWS RDS:
+
+```text
+production.abc123.rds.amazonaws.com
+```
+
+Вместо изменения конфигурации приложения можно создать:
+
+```text
+database
+    ↓
+ExternalName
+    ↓
+production.abc123.rds.amazonaws.com
+```
+
+### Коротко
+
+```text
+ExternalName
+→ DNS alias
+→ указывает на внешний DNS
+→ не балансирует трафик через kube-proxy
+→ не предназначен для выбора Kubernetes Pods
+```
+
+---
+
+## Headless Service
+
+**Headless Service — не отдельный `spec.type`.**
+
+Это Service, у которого отключён обычный ClusterIP:
+
+```yaml
+spec:
+  clusterIP: None
+```
+
+Пример:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb
+spec:
+  clusterIP: None
+  selector:
+    app: mongodb
+  ports:
+    - port: 27017
+```
+
+Главное отличие от обычного Service:
+
+### Обычный ClusterIP
+
+Есть единая виртуальная точка входа:
+
+```text
+Application
+     ↓
+mongodb:27017
+     ↓
+ClusterIP
+10.100.0.50
+     ↓
+один из MongoDB Pods
+```
+
+Клиенту неважно, какой конкретно Pod получит запрос.
+
+### Headless
+
+ClusterIP отсутствует:
+
+```text
+clusterIP: None
+```
+
+DNS может возвращать адреса непосредственно endpoints:
+
+```text
+Application
+     ↓
+mongodb
+     ↓
+DNS
+     ↓
+10.0.1.10
+10.0.2.15
+10.0.3.20
+```
+
+То есть клиент может получить IP конкретных Pod'ов и работать с ними напрямую.
+
+### Зачем это нужно?
+
+Для обычного stateless-приложения нам обычно всё равно:
+
+```text
+backend-1
+backend-2
+backend-3
+```
+
+Любой Pod может обработать запрос.
+
+Но для stateful/distributed приложений экземпляры могут иметь разную роль:
+
+```text
+postgres-0 → primary
+postgres-1 → replica
+postgres-2 → replica
+```
+
+или:
+
+```text
+kafka-0 → broker 0
+kafka-1 → broker 1
+kafka-2 → broker 2
+```
+
+Таким приложениям важно иметь возможность обращаться к **конкретному экземпляру**.
+
+Поэтому Headless Service часто используется вместе со StatefulSet.
+
+Например:
+
+```text
+StatefulSet: mongodb
+
+mongodb-0
+mongodb-1
+mongodb-2
+```
+
+Headless Service:
+
+```text
+mongodb
+```
+
+позволяет StatefulSet Pod'ам иметь стабильные DNS-имена вида:
+
+```text
+mongodb-0.mongodb.default.svc.cluster.local
+mongodb-1.mongodb.default.svc.cluster.local
+mongodb-2.mongodb.default.svc.cluster.local
+```
+
+Получается:
+
+```text
+mongodb-0.mongodb... → конкретно mongodb-0
+mongodb-1.mongodb... → конкретно mongodb-1
+mongodb-2.mongodb... → конкретно mongodb-2
+```
+
+Это важно, например, когда члены distributed-кластера должны знать друг друга:
+
+```text
+mongodb-0
+   │
+   ├──→ mongodb-1.mongodb
+   │
+   └──→ mongodb-2.mongodb
+```
+
+### Главное отличие
+
+Обычный Service скрывает отдельные Pod'ы за одной точкой:
+
+```text
+          ClusterIP
+              │
+      ┌───────┼───────┐
+      ↓       ↓       ↓
+    pod-0   pod-1   pod-2
+```
+
+Headless Service позволяет обнаруживать сами endpoints:
+
+```text
+DNS
+ │
+ ├──→ pod-0
+ ├──→ pod-1
+ └──→ pod-2
+```
+
+### Коротко
+
+```text
+Headless Service
+→ clusterIP: None
+→ нет виртуального Service IP
+→ DNS позволяет обнаружить Pod IP
+→ можно обращаться к конкретным Pod'ам
+→ часто используется вместе со StatefulSet
+```
+
+---
+
+## Service без selector
+
+Обычно Service находит Pod'ы через:
+
+```yaml
+selector:
+  app: backend
+```
+
+Но Service можно создать **без selector**:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-database
+spec:
+  ports:
+    - port: 5432
+```
+
+В таком случае Kubernetes не будет автоматически искать Pod'ы.
+
+Endpoints можно определить отдельно, например через `EndpointSlice`.
+
+Условно:
+
+```text
+Service
+external-database:5432
+        ↓
+EndpointSlice
+        ↓
+10.50.0.10:5432
+        ↓
+PostgreSQL на внешней VM
+```
+
+Это позволяет использовать стандартный Kubernetes Service для ресурса, который Kubernetes сам не управляет.
+
+Например:
+
+```text
+Application Pod
+      ↓
+external-database:5432
+      ↓
+Service
+      ↓
+10.50.0.10
+      ↓
+PostgreSQL VM
+```
+
+### Когда используется
+
+Например:
+
+- база находится на VM вне Kubernetes;
+- выполняется миграция приложения в Kubernetes;
+- backend управляется внешней системой;
+- нужно вручную контролировать endpoints.
+
+### Коротко
+
+```text
+Service с selector
+→ Kubernetes автоматически находит Pods
+
+Service без selector
+→ endpoints задаются отдельно
+→ backend необязательно является Kubernetes Pod
+```
+
+---
+
+## Сравнение типов Service
+
+| Вариант | ClusterIP | Доступ извне | Основной сценарий |
+|---|---|---|---|
+| `ClusterIP` | Да | Нет | Связь сервисов внутри кластера |
+| `NodePort` | Да | Да, через Node IP | Открыть порт на Node |
+| `LoadBalancer` | Обычно да | Да | Внешний cloud Load Balancer |
+| `ExternalName` | Нет обычного ClusterIP | Не в обычном смысле | DNS alias на внешний сервис |
+| `Headless` | **Нет (`None`)** | Обычно нет | Доступ/обнаружение отдельных Pod'ов |
+
+---
+
+## Как связаны ClusterIP, NodePort и LoadBalancer?
+
+Упрощённо их можно представить как уровни:
+
+```text
+ClusterIP
+    ↑
+NodePort
+    ↑
+LoadBalancer
+```
+
+### ClusterIP
+
+```text
+внутри Kubernetes
+
+Client Pod
+    ↓
+ClusterIP
+    ↓
+Pod
+```
+
+### NodePort
+
+Добавляем доступ через Node:
+
+```text
+Client
+    ↓
+NodeIP:NodePort
+    ↓
+ClusterIP / Service
+    ↓
+Pod
+```
+
+### LoadBalancer
+
+Добавляем внешний балансировщик:
+
+```text
+Internet
+    ↓
+External Load Balancer
+    ↓
+NodePort / Service
+    ↓
+Pod
+```
+
+Конкретный путь может отличаться в зависимости от cloud provider и используемого networking/load balancer controller.
+
+---
+
+## Коротко для собеседования
+
+**Service — это стабильная сетевая точка доступа к группе Pod'ов. Обычно Service находит Pod'ы через selector, а EndpointSlice содержит актуальные IP подходящих endpoints. Благодаря этому Pod'ы могут пересоздаваться и менять IP, а клиенты продолжают обращаться к стабильному DNS/IP Service.**
+
+Типы:
+
+```text
+ClusterIP
+→ доступ внутри кластера
+
+NodePort
+→ открывает порт на каждой Node
+
+LoadBalancer
+→ предоставляет внешний Load Balancer
+
+ExternalName
+→ DNS alias на внешний DNS
+
+Headless
+→ clusterIP: None
+→ позволяет обнаруживать отдельные Pod'ы
+→ часто используется со StatefulSet
+```
+
+Для быстрого запоминания:
+
+```text
+ClusterIP    → "дай мне один стабильный IP внутри кластера"
+
+NodePort     → "дай доступ через IP любой Node + порт"
+
+LoadBalancer → "дай доступ снаружи через внешний LB"
+
+ExternalName → "сделай Kubernetes DNS alias на внешний DNS"
+
+Headless     → "не давай общий IP, покажи мне сами Pod'ы"
+```
+
+**---**
+
+---
+
+### Что такое Ingress и как входящий трафик попадает в Pod?
+
+**Ingress** — Kubernetes-ресурс, который описывает правила маршрутизации входящего HTTP/HTTPS-трафика к сервисам внутри Kubernetes.
+
+Например:
+
+```text
+api.example.com → api-service
+web.example.com → frontend-service
+```
+
+Или маршрутизация по path:
+
+```text
+example.com/api   → api-service
+example.com/admin → admin-service
+example.com/      → frontend-service
+```
+
+Сам **Ingress не обрабатывает трафик**. Это только декларация правил.
+
+Для реализации этих правил нужен **Ingress Controller**, например:
+
+- NGINX Ingress Controller
+- Traefik
+- HAProxy
+- AWS Load Balancer Controller
+
+Упрощённо:
+
+```text
+Ingress = правила
+Ingress Controller = компонент, реализующий эти правила
+```
+
+---
+
+#### Пример Ingress
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: example
+spec:
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 80
+```
+
+Правило означает:
+
+```text
+api.example.com/*
+        ↓
+api-service:80
+```
+
+---
+
+### Как работает Ingress с внешним Load Balancer?
+
+Схема зависит от используемого Load Balancer и Ingress Controller.
+
+Один из вариантов — NGINX Ingress Controller:
+
+```text
+Internet
+   ↓
+AWS Load Balancer
+   ↓
+EKS nodes
+   ↓
+NGINX Ingress Controller
+   ↓
+Service / EndpointSlice
+   ↓
+Application Pods
+```
+
+Например, клиент делает:
+
+```text
+GET https://api.example.com/users
+```
+
+DNS указывает на AWS Load Balancer:
+
+```text
+api.example.com
+       ↓
+Route53
+       ↓
+AWS Load Balancer
+```
+
+Load Balancer доставляет трафик в EKS.
+
+NGINX Ingress Controller получает запрос и смотрит на:
+
+```text
+Host: api.example.com
+Path: /users
+```
+
+После чего на основании Ingress rules определяет backend:
+
+```text
+api.example.com/*
+        ↓
+api-service
+        ↓
+api Pods
+```
+
+---
+
+### Как работает Classic Load Balancer с Ingress Controller?
+
+Classic Load Balancer сам не знает о Kubernetes Ingress и не выбирает конкретный Ingress Controller Pod.
+
+Обычно Ingress Controller публикуется через Service типа `LoadBalancer`/`NodePort`.
+
+Например:
+
+```text
+ingress-nginx Service
+
+port:     80
+NodePort: 31234
+```
+
+AWS Load Balancer отправляет трафик на ноды:
+
+```text
+                    CLB
+                     │
+        ┌────────────┼────────────┐
+        ↓            ↓            ↓
+ node-1:31234  node-2:31234  node-3:31234
+```
+
+CLB балансирует между зарегистрированными healthy EC2 instances.
+
+После попадания запроса на NodePort Kubernetes Service направляет его в Ingress Controller Pod.
+
+```text
+Client
+  ↓
+CLB
+  ↓
+EKS Node : NodePort
+  ↓
+Service
+  ↓
+Ingress Controller
+  ↓
+Application Service
+  ↓
+Application Pod
+```
+
+Таким образом здесь может быть несколько уровней балансировки:
+
+```text
+CLB
+ ↓
+балансировка между EKS nodes
+
+Ingress Controller
+ ↓
+маршрутизация/балансировка до backend приложения
+
+Application Pods
+```
+
+---
+
+### Что такое externalTrafficPolicy?
+
+`externalTrafficPolicy` настраивается **в Kubernetes Service**, а не на Node.
+
+Например:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingress-nginx
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Cluster
+```
+
+Есть два основных значения:
+
+#### externalTrafficPolicy: Cluster
+
+Внешний запрос может прийти на одну ноду, а обслужить его может Pod на другой ноде.
+
+```text
+Load Balancer
+      ↓
+    node-1
+      ↓
+    Service
+      ↓
+    node-3
+      ↓
+Ingress Controller Pod
+```
+
+То есть:
+
+```text
+LB → Node A → Pod на Node B
+```
+
+#### externalTrafficPolicy: Local
+
+Трафик обслуживается только Pod'ами, находящимися локально на ноде, куда пришёл запрос.
+
+```text
+Load Balancer
+      ↓
+    node-1
+      ↓
+Ingress Controller Pod на node-1
+```
+
+То есть:
+
+```text
+LB → Node A → Pod на Node A
+```
+
+`Local` также часто используется, когда необходимо сохранить настоящий source IP клиента.
+
+Для запоминания:
+
+```text
+Cluster → можно переслать трафик на другую Node
+Local   → использовать только локальные Pods
+```
+
+---
+
+### Как работает AWS Application Load Balancer (ALB)?
+
+ALB — **Layer 7 Load Balancer**, поэтому понимает HTTP/HTTPS.
+
+Он может маршрутизировать запросы по:
+
+- hostname;
+- path;
+- HTTP headers;
+- HTTP methods;
+- query parameters и другим L7-условиям.
+
+Например:
+
+```text
+                       ALB
+                        │
+            ┌───────────┴───────────┐
+            │                       │
+     api.example.com         web.example.com
+            │                       │
+      Target Group A          Target Group B
+        │    │    │             │       │
+        ↓    ↓    ↓             ↓       ↓
+      pod1  pod2  pod3         pod4    pod5
+```
+
+Сначала ALB выбирает **Target Group** на основании Listener Rules:
+
+```text
+api.example.com/* → API Target Group
+web.example.com/* → WEB Target Group
+```
+
+Затем распределяет запрос между healthy targets выбранной Target Group.
+
+Например:
+
+```text
+GET https://api.example.com/users
+              ↓
+             ALB
+              ↓
+Host = api.example.com
+              ↓
+       API Target Group
+              ↓
+        один из targets
+```
+
+В Target Group могут находиться EKS Nodes или непосредственно Pod IP.
+
+---
+
+### AWS Load Balancer Controller + ALB
+
+AWS Load Balancer Controller может читать Kubernetes Ingress и на его основании создавать и настраивать ALB.
+
+```text
+Kubernetes Ingress
+        ↓
+AWS Load Balancer Controller
+        ↓
+создаёт/настраивает ALB
+        ↓
+Listener Rules + Target Groups
+```
+
+При `target-type: ip` targets — непосредственно IP Pod'ов:
+
+```text
+Internet
+   ↓
+ALB
+   ↓
+Listener Rule
+   ↓
+Target Group
+   │
+   ├── Pod 10.0.1.10
+   ├── Pod 10.0.2.15
+   └── Pod 10.0.3.27
+```
+
+В таком случае отдельный NGINX Ingress Controller не нужен:
+
+```text
+Client
+  ↓
+Route53
+  ↓
+ALB
+  ↓
+выбор Target Group по host/path
+  ↓
+выбор healthy Pod
+  ↓
+Application Pod
+```
+
+---
+
+### CLB vs ALB vs NLB
+
+| Load Balancer | Уровень | Основное назначение |
+|---|---|---|
+| **CLB** | L4/L7 | Legacy AWS Load Balancer |
+| **ALB** | L7 | HTTP/HTTPS, маршрутизация по host/path и другим HTTP-параметрам |
+| **NLB** | L4 | TCP/UDP/TLS, высокая производительность, статические IP |
+
+Упрощённо:
+
+```text
+CLB → старый универсальный AWS LB
+
+ALB → понимает HTTP
+      api.example.com → backend A
+      /images         → backend B
+
+NLB → работает преимущественно с TCP/UDP
+      IP:PORT → target
+```
+
+---
+
+### Коротко для собеседования
+
+**Ingress** — Kubernetes API-ресурс, описывающий правила маршрутизации входящего HTTP/HTTPS-трафика к Service. Сам Ingress трафик не обрабатывает — правила должен реализовать Ingress Controller.
+
+Классическая схема с NGINX:
+
+```text
+Internet
+   ↓
+AWS LB
+   ↓
+EKS Node / NodePort
+   ↓
+NGINX Ingress Controller
+   ↓
+Service
+   ↓
+Pod
+```
+
+С AWS Load Balancer Controller и ALB:
+
+```text
+Internet
+   ↓
+ALB
+   ↓
+Listener Rules
+   ↓
+Target Group
+   ↓
+Pod IP
+```
+
+Главное запомнить:
+
+```text
+Ingress = правила маршрутизации
+Ingress Controller = реализация этих правил
+
+CLB → обычно балансирует внешний трафик до nodes
+ALB → L7, умеет сам маршрутизировать по host/path
+NLB → L4, работает с TCP/UDP/TLS
+
+externalTrafficPolicy: Cluster
+→ Node может передать трафик Pod'у на другой Node
+
+externalTrafficPolicy: Local
+→ трафик обслуживает только локальный Pod
+```
+
 ---
 
 ### Что такое Job
